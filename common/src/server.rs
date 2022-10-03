@@ -4,8 +4,12 @@ use crate::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 use thiserror::Error;
+use uuid::Uuid;
 
 //
 
@@ -14,6 +18,8 @@ use thiserror::Error;
 pub enum ServerPacket {
     // This first variant should never change
     Init(ServerInitPacket),
+
+    Chat(ServerChatPacket),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +37,38 @@ pub enum ServerInitPacket {
         // version mismatch or ...
         reason: ServerInitFailReason,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ServerChatPacket {
+    // member packets
+    Members { members: HashSet<Uuid> },
+    NewMember { member: Uuid },
+    RemoveMember { member: Uuid },
+    MemberInfo { members: HashMap<Uuid, MemberInfo> },
+
+    // message packets
+    NewMessage { sender: Uuid, message: String },
+    RemoveMessage { sender: Uuid },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberInfo {
+    pub name: String,
+    pub status: MemberStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MemberStatus {
+    /// User is online (Active or Idle)
+    Online,
+
+    /// User is online (Do not disturb not Dungeons&Dragons)
+    Dnd,
+
+    /// User is offline
+    Offline,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Error)]

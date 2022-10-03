@@ -31,7 +31,8 @@ async fn main() {
         no_unicode,
     } = CliArgs::parse();
 
-    tui::run(Duration::from_millis(tui_tick_rate as _), no_unicode);
+    tui::run(Duration::from_millis(tui_tick_rate as _), no_unicode).unwrap();
+    return;
 
     let addr = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 13331, 0, 0).into();
     let socket = Socket::connect(addr).await;

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub enum ClientPacket {
     /// This first variant should never change
     Init(ClientInitPacket),
+
+    Chat(ClientChatPacket),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +18,12 @@ pub enum ClientPacket {
 pub enum ClientInitPacket {
     /// This first variant should never change
     ClientInfo(CompatibilityInfo),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum ClientChatPacket {
+    RequestMembers,
 }
 
 //
