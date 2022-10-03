@@ -1,4 +1,5 @@
 use ::tui::{Frame, Terminal};
+use chrono::{DateTime, Local};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -6,22 +7,37 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use notify_rust::Notification;
 use std::{
+    collections::HashMap,
     error::Error,
+    fmt::{self, Display, Formatter},
     io::{self, Stdout},
+    mem::swap,
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::{Receiver, Sender};
 use tui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::Span,
+    style::{Color, Modifier, Style},
+    text::{Span, Spans},
     widgets::{Block, Borders, Paragraph},
 };
+use tui_chat_app_common::{
+    client::{ClientChatPacket, ClientPacket},
+    server::{ServerChatPacket, ServerPacket},
+};
+use uuid::Uuid;
 
 //
 
-pub fn run(tick_rate: Duration, no_unicode: bool) -> Result<(), Box<dyn Error>> {
+pub async fn run(
+    tick_rate: Duration,
+    no_unicode: bool,
+    recv: Receiver<ServerPacket>,
+    send: Sender<ClientPacket>,
+) -> Result<(), Box<dyn Error>> {
     // setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -29,7 +45,9 @@ pub fn run(tick_rate: Duration, no_unicode: bool) -> Result<(), Box<dyn Error>> 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = App::new(no_unicode).run(&mut terminal, tick_rate);
+    let result = App::new(no_unicode, recv, send)
+        .run(&mut terminal, tick_rate)
+        .await;
 
     // restore
     disable_raw_mode()?;
@@ -53,7 +71,12 @@ struct App {
     focus: Focus,
     input: String,
 
-    messages: Vec<String>,
+    messages: Vec<Message>,
+    all_messages: HashMap<Uuid, HashMap<Uuid, String>>,
+    self_id: SelfUuid,
+
+    recv: Receiver<ServerPacket>,
+    send: Sender<ClientPacket>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,10 +85,33 @@ enum Focus {
     Chat { idx: usize },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelfUuid {
+    Some(Uuid),
+    Pending(Instant),
+    None,
+}
+
+struct Message {
+    sender_id: Uuid,
+    message_id: Uuid,
+    timestamp: DateTime<Local>,
+}
+
 //
 
+impl Display for SelfUuid {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            SelfUuid::Some(uuid) => write!(f, "{uuid}"),
+            SelfUuid::Pending(_) => write!(f, "name pending"),
+            SelfUuid::None => write!(f, "name none"),
+        }
+    }
+}
+
 impl App {
-    fn new(no_unicode: bool) -> Self {
+    fn new(no_unicode: bool, recv: Receiver<ServerPacket>, send: Sender<ClientPacket>) -> Self {
         Self {
             no_unicode,
             should_close: false,
@@ -74,10 +120,15 @@ impl App {
             input: String::new(),
 
             messages: vec![],
+            all_messages: HashMap::new(),
+            self_id: SelfUuid::None,
+
+            recv,
+            send,
         }
     }
 
-    fn run(
+    async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
         tick_rate: Duration,
@@ -101,12 +152,12 @@ impl App {
                             self.should_close = true
                         }
                         KeyCode::Esc => self.should_close = true,
-                        _ => self.key_event(key),
+                        _ => self.key_event(key).await,
                     }
                 }
             }
             if last_tick.elapsed() >= tick_rate {
-                self.tick();
+                self.tick().await;
                 last_tick = Instant::now();
             }
             if self.should_close {
@@ -117,8 +168,8 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame<CrosstermBackend<Stdout>>) {
         let Rect { width, height, .. } = frame.size();
-        let min_width = 96;
-        let min_height = 24;
+        let min_width = 50;
+        let min_height = 14;
         if width < min_width || height < min_height {
             frame.render_widget(
                 Paragraph::new(vec![
@@ -153,7 +204,7 @@ impl App {
             .constraints([
                 Constraint::Length(9),
                 Constraint::Length(1),
-                Constraint::Min(86),
+                Constraint::Min(40),
             ])
             .direction(Direction::Horizontal)
             .split(frame.size());
@@ -171,7 +222,7 @@ impl App {
     fn draw_server(&mut self, frame: &mut Frame<CrosstermBackend<Stdout>>, rect: Rect) {
         let split = Layout::default()
             .constraints([
-                Constraint::Min(65),
+                Constraint::Min(19),
                 Constraint::Length(1),
                 Constraint::Length(20),
             ])
@@ -193,7 +244,7 @@ impl App {
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(1),
-                Constraint::Min(20),
+                Constraint::Min(10),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
@@ -204,11 +255,56 @@ impl App {
 
         // title
         let title_view = split[0];
-        frame.render_widget(Block::default().title("Server name"), title_view);
+        frame.render_widget(
+            Block::default().title(format!("Server name - {}", self.self_id)),
+            title_view,
+        );
 
         // messages
         let message_view = split[2];
         frame.render_widget(Block::default(), message_view);
+
+        let mut messages = self
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|m| Some((m, self.all_messages.get(&m.sender_id)?)))
+            .filter_map(|(m, sender)| Some((m, sender.get(&m.message_id)?)));
+
+        let mut message_buffer: Vec<Spans> = vec![];
+        let mut last_sender = None;
+        while let Some((message, message_str)) = messages.next() {
+            if last_sender != Some(message.sender_id) {
+                message_buffer.push(vec![].into());
+                message_buffer.push(
+                    vec![
+                        Span::styled(
+                            format!("{}", message.sender_id),
+                            Style::default().fg(Color::LightCyan),
+                        ),
+                        Span::styled(
+                            format!(" {}", message.timestamp.format("%H:%M:%S")),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::ITALIC)
+                                .add_modifier(Modifier::DIM),
+                        ),
+                    ]
+                    .into(),
+                );
+            }
+            last_sender = Some(message.sender_id);
+
+            message_buffer.push(
+                vec![Span::styled(
+                    message_str.as_str(),
+                    Style::default().fg(Color::White),
+                )]
+                .into(),
+            );
+        }
+
+        frame.render_widget(Paragraph::new(message_buffer), message_view);
 
         // input
         let input_view = split[4];
@@ -228,9 +324,57 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {}
+    async fn tick(&mut self) {
+        match self.recv.try_recv() {
+            Ok(ServerPacket::Chat(ServerChatPacket::NewMessage {
+                sender_id,
+                message_id,
+                message,
+            })) => {
+                if self.self_id != SelfUuid::Some(sender_id) {
+                    let notify = format!("{sender_id}:\n{message}");
+                    let _ = Notification::new()
+                        .summary("Message")
+                        .body(notify.as_str())
+                        .show();
+                }
 
-    fn key_event(&mut self, event: KeyEvent) {
+                self.all_messages
+                    .entry(sender_id)
+                    .or_default()
+                    .insert(message_id, message);
+                self.messages.push(Message {
+                    sender_id,
+                    message_id,
+                    timestamp: Local::now(),
+                });
+            }
+            Ok(ServerPacket::Chat(ServerChatPacket::SelfMember { member_id })) => {
+                self.self_id = SelfUuid::Some(member_id);
+            }
+            _ => (),
+        }
+
+        match self.self_id {
+            SelfUuid::None => {
+                self.self_id = SelfUuid::Pending(Instant::now());
+                let _ = self
+                    .send
+                    .send(ClientPacket::Chat(ClientChatPacket::RequestSelfMember))
+                    .await;
+            }
+            SelfUuid::Pending(i) if i.elapsed() >= Duration::SECOND => {
+                self.self_id = SelfUuid::Pending(Instant::now());
+                let _ = self
+                    .send
+                    .send(ClientPacket::Chat(ClientChatPacket::RequestSelfMember))
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn key_event(&mut self, event: KeyEvent) {
         if let Focus::Input { idx } = &mut self.focus {
             match event.code {
                 // Doesn't work in crossterm yet
@@ -271,7 +415,18 @@ impl App {
                         return;
                     }
 
-                    let input = self.input.trim();
+                    self.focus = Focus::Input { idx: 0 };
+                    let mut input = String::new();
+                    swap(&mut input, &mut self.input);
+                    let message_id = Uuid::new_v4();
+
+                    let _ = self
+                        .send
+                        .send(ClientPacket::Chat(ClientChatPacket::SendMessage {
+                            message_id,
+                            message: input.to_string(),
+                        }))
+                        .await;
                 }
                 _ => {}
             }

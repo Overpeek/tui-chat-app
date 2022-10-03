@@ -6,7 +6,7 @@ use thiserror::Error;
 
 pub static COMPAT_INFO: CompatibilityInfo = CompatibilityInfo {
     magic_bytes: MagicBytes(0x3064396a3df83f1d),
-    version: Version([0, 0, 0]),
+    version: Version([0, 1, 0]),
 };
 
 //

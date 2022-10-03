@@ -1,5 +1,6 @@
 #![feature(const_socketaddr)]
 #![feature(try_blocks)]
+#![feature(duration_constants)]
 
 //
 
@@ -11,6 +12,7 @@ use std::{
     net::{Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
 };
+use tokio::sync::broadcast::channel;
 
 //
 
@@ -86,7 +88,13 @@ async fn main() {
 
     let connections = Arc::new(DashSet::new());
 
+    let (send, recv) = channel(256);
+    let send = Arc::new(send);
+
     while let Some(conn) = listener.next().await {
-        tokio::spawn(handler::handler(conn, connections.clone()));
+        let send = send.clone();
+        let recv = recv.resubscribe();
+
+        tokio::spawn(handler::handler(conn, connections.clone(), send, recv));
     }
 }

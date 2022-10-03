@@ -1,9 +1,14 @@
+#![feature(duration_constants)]
+
+//
+
 use clap::Parser;
 use eznet::socket::Socket;
 use std::{
     net::{Ipv6Addr, SocketAddrV6},
     time::Duration,
 };
+use tokio::sync::mpsc::channel;
 
 //
 
@@ -31,14 +36,25 @@ async fn main() {
         no_unicode,
     } = CliArgs::parse();
 
-    tui::run(Duration::from_millis(tui_tick_rate as _), no_unicode).unwrap();
-    return;
+    let (t_send, recv) = channel(256);
+    let (send, t_recv) = channel(256);
 
-    let addr = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 13331, 0, 0).into();
-    let socket = Socket::connect(addr).await;
+    tokio::spawn(async move {
+        let addr = SocketAddrV6::new(Ipv6Addr::LOCALHOST, 13331, 0, 0).into();
+        let socket = Socket::connect(addr).await;
 
-    match socket {
-        Ok(socket) => handler::handler(socket).await,
-        Err(err) => eprintln!("{err}"),
-    }
+        match socket {
+            Ok(socket) => handler::handler(socket, t_recv, t_send).await,
+            Err(err) => eprintln!("{err}"),
+        }
+    });
+
+    tui::run(
+        Duration::from_millis(tui_tick_rate as _),
+        no_unicode,
+        recv,
+        send,
+    )
+    .await
+    .unwrap();
 }
